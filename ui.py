@@ -20,7 +20,7 @@ def set_dpi_awareness() -> None:
 
 
 class Calibrator(tk.Toplevel):
-    """Semi-transparent, borderless, draggable/resizable region picker."""
+    """Semi-transparent region picker for HP bars."""
 
     def __init__(self, master: tk.Tk, title: str, initial: Optional[dict], on_save):
         super().__init__(master)
@@ -84,6 +84,33 @@ class Calibrator(tk.Toplevel):
                 "height": int(self.body.winfo_height()),
             }
         )
+        self.destroy()
+
+
+class PointPicker(tk.Toplevel):
+    """Fullscreen overlay: one left-click saves skill-slot coordinates."""
+
+    def __init__(self, master: tk.Tk, title: str, on_save):
+        super().__init__(master)
+        self._on_save = on_save
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.25)
+        self.configure(bg="#1a5276")
+        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        tk.Label(
+            self,
+            text=f"{title}\nКлікніть ЛКМ по слоту на панелі умінь",
+            bg="#1a5276",
+            fg="white",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(expand=True)
+        self.bind("<ButtonPress-1>", self._click)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.focus_force()
+
+    def _click(self, e) -> None:
+        self._on_save({"x": int(e.x_root), "y": int(e.y_root)})
         self.destroy()
 
 
@@ -177,8 +204,6 @@ class CalibPreview(tk.Toplevel):
 
 class App(tk.Tk):
     FIELDS = (
-        ("attack_key", "Клавіша атаки", 12),
-        ("next_target_key", "Клавіша наступної цілі", 12),
         ("pause_min_ms", "Пауза мін (мс)", 8),
         ("pause_max_ms", "Пауза макс (мс)", 8),
         ("stuck_seconds", "Застрягання (с)", 8),
@@ -196,7 +221,6 @@ class App(tk.Tk):
         self.cfg = load_config()
         self.q: queue.Queue = queue.Queue()
         self.bot: Optional[AssistBot] = None
-        self._kb = None
         self.vars = {key: tk.StringVar(value=str(self.cfg.get(key, ""))) for key, *_ in self.FIELDS}
 
         pad = {"padx": 6, "pady": 2}
@@ -210,39 +234,49 @@ class App(tk.Tk):
             tk.Entry(self, textvariable=self.vars[key], width=width).grid(row=i, column=1, sticky="ew", **pad)
 
         btns = tk.Frame(self)
-        btns.grid(row=9, column=0, columnspan=2, sticky="ew", pady=4)
+        btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=4)
         self.btn_start = ttk.Button(btns, text="Старт", command=self._start)
-        self.btn_stop = ttk.Button(btns, text="Стоп", command=lambda: self._request_stop("Зупинено користувачем."), state="disabled")
+        self.btn_stop = ttk.Button(
+            btns, text="Стоп", command=lambda: self._request_stop("Зупинено користувачем."), state="disabled"
+        )
         self.btn_start.pack(side="left", padx=4)
         self.btn_stop.pack(side="left", padx=4)
 
         cal = tk.Frame(self)
-        cal.grid(row=10, column=0, columnspan=2, sticky="ew")
-        ttk.Button(cal, text="Калібрувати ціль", command=lambda: self._calibrate("target_region", "HP цілі")).pack(side="left", padx=4, pady=2)
-        ttk.Button(cal, text="Калібрувати моє HP", command=lambda: self._calibrate("own_hp_region", "Моє HP")).pack(side="left", padx=4, pady=2)
+        cal.grid(row=8, column=0, columnspan=2, sticky="ew")
+        ttk.Button(cal, text="Калібрувати ціль", command=lambda: self._calibrate("target_region", "HP цілі")).pack(
+            side="left", padx=4, pady=2
+        )
+        ttk.Button(cal, text="Калібрувати моє HP", command=lambda: self._calibrate("own_hp_region", "Моє HP")).pack(
+            side="left", padx=4, pady=2
+        )
+
+        clicks = tk.Frame(self)
+        clicks.grid(row=9, column=0, columnspan=2, sticky="ew")
+        ttk.Button(clicks, text="Клік атаки", command=lambda: self._pick_point("attack_click", "Слот атаки")).pack(
+            side="left", padx=4, pady=2
+        )
+        ttk.Button(
+            clicks, text="Клік наступної цілі", command=lambda: self._pick_point("next_click", "Слот наступної цілі")
+        ).pack(side="left", padx=4, pady=2)
 
         ttk.Button(self, text="Перевірити калібрування", command=self._open_preview).grid(
-            row=11, column=0, columnspan=2, padx=6, pady=2, sticky="ew"
+            row=10, column=0, columnspan=2, padx=6, pady=2, sticky="ew"
         )
 
         self.logbox = scrolledtext.ScrolledText(self, height=8, width=42, state="disabled", wrap="word")
-        self.logbox.grid(row=12, column=0, columnspan=2, padx=6, pady=6, sticky="nsew")
+        self.logbox.grid(row=11, column=0, columnspan=2, padx=6, pady=6, sticky="nsew")
 
-        self._bind_f12()
         self.after(50, self._pump)
-        self._log("Готово. Відкалібруйте смуги HP і натисніть Старт. F12 — стоп.")
+        self._log("Готово. Відкалібруйте HP і кліки по слотах. Старт → клікніть у гру.")
 
     def _read_fields(self) -> None:
-        ints = {"pause_min_ms", "pause_max_ms", "stuck_seconds", "max_stuck", "own_hp_stop"}
         for key, *_ in self.FIELDS:
             raw = self.vars[key].get().strip()
-            if key in ints:
-                try:
-                    self.cfg[key] = int(raw)
-                except ValueError:
-                    pass
-            else:
-                self.cfg[key] = raw or self.cfg[key]
+            try:
+                self.cfg[key] = int(raw)
+            except ValueError:
+                pass
 
     def _calibrate(self, field: str, title: str) -> None:
         def saved(region):
@@ -251,6 +285,14 @@ class App(tk.Tk):
             self._log(f"{title}: {region['width']}×{region['height']} @ ({region['left']}, {region['top']})")
 
         Calibrator(self, title, self.cfg.get(field), saved)
+
+    def _pick_point(self, field: str, title: str) -> None:
+        def saved(point):
+            self.cfg[field] = point
+            save_config(self.cfg)
+            self._log(f"{title}: клік @ ({point['x']}, {point['y']})")
+
+        PointPicker(self, title, saved)
 
     def _open_preview(self) -> None:
         win = getattr(self, "_preview", None)
@@ -270,7 +312,6 @@ class App(tk.Tk):
         self.bot.start()
 
     def _request_stop(self, reason: str) -> None:
-        # Queue-only UI updates so F12 (keyboard hook thread) stays thread-safe.
         if self.bot:
             self.bot.stop(reason)
         else:
@@ -308,25 +349,11 @@ class App(tk.Tk):
             pass
         self.after(50, self._pump)
 
-    def _bind_f12(self) -> None:
-        try:
-            import keyboard
-
-            keyboard.add_hotkey("f12", lambda: self._request_stop("Зупинено клавішею F12."))
-            self._kb = keyboard
-        except Exception as exc:
-            self._log(f"Глобальну F12 не підключено ({exc}). Запустіть від адміністратора.")
-
     def _close(self) -> None:
         self._request_stop("Вікно закрито.")
         prev = getattr(self, "_preview", None)
         if prev is not None and prev.winfo_exists():
             prev._close()
-        if self._kb is not None:
-            try:
-                self._kb.unhook_all()
-            except Exception:
-                pass
         self.destroy()
 
 

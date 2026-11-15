@@ -1,13 +1,23 @@
 {
-  "attack_key": "F1",
-  "next_target_key": "F2",
   "pause_min_ms": 300,
   "pause_max_ms": 700,
   "stuck_seconds": 8,
   "max_stuck": 3,
-  "own_hp_stop": 30,
-  "target_region": null,
-  "own_hp_region": null,
+  "own_hp_stop": 0,
+  "target_region": {
+    "left": 816,
+    "top": 25,
+    "width": 260,
+    "height": 52
+  },
+  "own_hp_region": {
+    "left": 6,
+    "top": 40,
+    "width": 304,
+    "height": 48
+  },
+  "attack_click": null,
+  "next_click": null,
   "red_min": 120,
   "red_ratio": 1.8
 }

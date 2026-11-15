@@ -1,4 +1,4 @@
-"""Lineage 2 assist: screen HP bars -> attack / next-target keys."""
+"""Lineage 2 assist: screen HP bars -> mouse clicks on skill slots."""
 
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ from typing import Callable, Optional
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 DEFAULTS = {
-    "attack_key": "F1",
-    "next_target_key": "F2",
     "pause_min_ms": 300,
     "pause_max_ms": 700,
     "stuck_seconds": 8,
@@ -21,12 +19,11 @@ DEFAULTS = {
     "own_hp_stop": 30,
     "target_region": None,
     "own_hp_region": None,
+    "attack_click": None,  # {"x": int, "y": int}
+    "next_click": None,
     "red_min": 120,
     "red_ratio": 1.8,
 }
-
-# Lazy so the module imports on non-Windows.
-pydirectinput = None
 
 
 def load_config() -> dict:
@@ -58,7 +55,6 @@ def red_column_mask(
     red_ratio: float = 1.8,
     rows: int = 3,
 ) -> list:
-    """True for columns with a red pixel in the mid scan rows (same rule as HP%)."""
     if width <= 0 or height <= 0 or not bgra:
         return []
     mid = height // 2
@@ -88,7 +84,6 @@ def hp_percent(
     red_ratio: float = 1.8,
     rows: int = 3,
 ) -> int:
-    """HP% from mss BGRA bytes: rightmost red column / width, scanning mid rows."""
     mask = red_column_mask(bgra, width, height, red_min, red_ratio, rows)
     rightmost = -1
     for x, flag in enumerate(mask):
@@ -100,7 +95,6 @@ def hp_percent(
 
 
 def bgra_to_ppm(bgra: bytes, width: int, height: int) -> bytes:
-    """Binary PPM (P6) from mss BGRA, for tk.PhotoImage without PIL."""
     if width <= 0 or height <= 0:
         return b"P6\n1 1\n255\n\x00\x00\x00"
     rgb = bytearray(width * height * 3)
@@ -116,7 +110,6 @@ def bgra_to_ppm(bgra: bytes, width: int, height: int) -> bytes:
 
 
 def mask_strip_ppm(mask: list, strip_h: int = 8) -> bytes:
-    """Thin PPM strip: red-detected columns in red, others in gray."""
     width = len(mask)
     if width <= 0 or strip_h <= 0:
         return b"P6\n1 1\n255\n\x00\x00\x00"
@@ -134,21 +127,26 @@ def preview_ppms(
     red_ratio: float = 1.8,
     strip_h: int = 8,
 ):
-    """(capture PPM, column-mask PPM, HP%) for the calibration preview."""
     mask = red_column_mask(bgra, width, height, red_min, red_ratio)
     return bgra_to_ppm(bgra, width, height), mask_strip_ppm(mask, strip_h), hp_percent(
         bgra, width, height, red_min, red_ratio
     )
 
 
-def _ensure_pydirectinput():
-    global pydirectinput
-    if pydirectinput is None:
-        import pydirectinput as _p
+def click_at(point: Optional[dict]) -> bool:
+    """Left-click at screen coordinates."""
+    if not point or "x" not in point or "y" not in point:
+        return False
+    import ctypes
 
-        pydirectinput = _p
-        pydirectinput.PAUSE = 0.05
-    return pydirectinput
+    x, y = int(point["x"]), int(point["y"])
+    user32 = ctypes.windll.user32
+    user32.SetCursorPos(x, y)
+    time.sleep(0.02)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+    time.sleep(0.04)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+    return True
 
 
 class AssistBot:
@@ -165,6 +163,7 @@ class AssistBot:
         self.on_stop = on_stop
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._click_error = False
 
     @property
     def running(self) -> bool:
@@ -186,18 +185,45 @@ class AssistBot:
             self.on_log(reason)
             self.on_stop(reason)
 
-    def _press(self, key: str) -> None:
-        pdi = _ensure_pydirectinput()
-        pdi.press(key.lower())
+    def _do_click(self, point: Optional[dict], label: str) -> None:
+        try:
+            if not click_at(point):
+                if not self._click_error:
+                    self._click_error = True
+                    self.on_log(f"Немає точки кліку для «{label}». Відкалібруйте слот.")
+                return
+        except Exception as exc:
+            if not self._click_error:
+                self._click_error = True
+                self.on_log(f"Помилка кліку ({label}): {exc}")
+
+    def _grab_region(self, region: dict, sct):
+        box = {
+            "left": int(region["left"]),
+            "top": int(region["top"]),
+            "width": int(region["width"]),
+            "height": int(region["height"]),
+        }
+        last_exc: Optional[Exception] = None
+        for _ in range(3):
+            try:
+                return sct.grab(box)
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.05)
+        try:
+            sct.grab(sct.monitors[1])
+            return sct.grab(box)
+        except Exception as exc:
+            raise last_exc or exc
 
     def _grab_hp(self, region: Optional[dict], sct) -> Optional[int]:
         if not region:
             return None
-        left, top = int(region["left"]), int(region["top"])
         w, h = int(region["width"]), int(region["height"])
         if w <= 0 or h <= 0:
             return None
-        shot = sct.grab({"left": left, "top": top, "width": w, "height": h})
+        shot = self._grab_region(region, sct)
         return hp_percent(
             shot.bgra if hasattr(shot, "bgra") else bytes(shot.raw),
             shot.width,
@@ -212,22 +238,21 @@ class AssistBot:
         except ImportError:
             self.stop("Не встановлено mss. pip install -r requirements.txt")
             return
-        try:
-            _ensure_pydirectinput()
-        except ImportError:
-            self.stop("Не встановлено pydirectinput. pip install -r requirements.txt")
-            return
 
         target_reg = self.cfg.get("target_region")
         if not target_reg:
             self.stop("Спочатку відкалібруйте смугу HP цілі.")
             return
 
+        attack_click = self.cfg.get("attack_click")
+        next_click = self.cfg.get("next_click")
+        if not attack_click or not next_click:
+            self.stop("Відкалібруйте кліки: слот атаки і слот наступної цілі.")
+            return
+
         stuck_sec = float(self.cfg.get("stuck_seconds", 8))
         max_stuck = int(self.cfg.get("max_stuck", 3))
         own_stop = int(self.cfg.get("own_hp_stop", 30))
-        attack = str(self.cfg.get("attack_key", "F1"))
-        nxt = str(self.cfg.get("next_target_key", "F2"))
         pmin = int(self.cfg.get("pause_min_ms", 300))
         pmax = int(self.cfg.get("pause_max_ms", 700))
         if pmax < pmin:
@@ -236,7 +261,9 @@ class AssistBot:
         last_hp: Optional[int] = None
         last_change = time.monotonic()
         stuck_count = 0
-        self.on_log("Бот запущено.")
+        self.on_log("Бот запущено (кліки). Через 2 с — клікніть у гру.")
+        if self._stop.wait(2.0):
+            return
 
         with mss.mss() as sct:
             while not self._stop.is_set():
@@ -257,11 +284,11 @@ class AssistBot:
 
                 now = time.monotonic()
                 if target_hp <= 0:
-                    self._press(nxt)
+                    self._do_click(next_click, "наступна ціль")
                     last_hp = None
                     last_change = now
                 elif last_hp is not None and target_hp == last_hp and (now - last_change) >= stuck_sec:
-                    self._press(nxt)
+                    self._do_click(next_click, "наступна ціль")
                     stuck_count += 1
                     self.on_log(
                         f"HP цілі не змінюється {stuck_sec:.0f} с — наступна ціль "
@@ -278,7 +305,7 @@ class AssistBot:
                     if last_hp != target_hp:
                         last_hp = target_hp
                         last_change = now
-                    self._press(attack)
+                    self._do_click(attack_click, "атака")
 
                 wait = random.uniform(pmin, pmax) / 1000.0
                 if self._stop.wait(wait):
