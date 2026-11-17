@@ -1,5 +1,5 @@
 {
-  "pause_min_ms": 300,
+  "pause_min_ms": 400,
   "pause_max_ms": 700,
   "stuck_seconds": 8,
   "max_stuck": 3,
@@ -16,8 +16,14 @@
     "width": 304,
     "height": 48
   },
-  "attack_click": null,
-  "next_click": null,
+  "attack_aim": {
+    "x": 488,
+    "y": 957
+  },
+  "next_aim": {
+    "x": 527,
+    "y": 957
+  },
   "red_min": 120,
   "red_ratio": 1.8
 }

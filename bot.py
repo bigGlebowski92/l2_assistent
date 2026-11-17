@@ -1,4 +1,4 @@
-"""Lineage 2 assist: screen HP bars -> mouse clicks on skill slots."""
+"""Lineage 2 assist: read HP bars, aim mouse at F1/F2 slots (no clicks)."""
 
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ from typing import Callable, Optional
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 DEFAULTS = {
-    "pause_min_ms": 300,
+    "pause_min_ms": 400,
     "pause_max_ms": 700,
     "stuck_seconds": 8,
     "max_stuck": 3,
     "own_hp_stop": 30,
     "target_region": None,
     "own_hp_region": None,
-    "attack_click": None,  # {"x": int, "y": int}
-    "next_click": None,
+    "attack_aim": None,  # {"x": int, "y": int} — F1 slot
+    "next_aim": None,  # {"x": int, "y": int} — F2 slot
     "red_min": 120,
     "red_ratio": 1.8,
 }
@@ -32,7 +32,13 @@ def load_config() -> dict:
         try:
             saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(saved, dict):
-                data.update(saved)
+                if "attack_aim" not in saved and saved.get("attack_click"):
+                    saved["attack_aim"] = saved["attack_click"]
+                if "next_aim" not in saved and saved.get("next_click"):
+                    saved["next_aim"] = saved["next_click"]
+                for k in DEFAULTS:
+                    if k in saved:
+                        data[k] = saved[k]
         except (OSError, json.JSONDecodeError):
             pass
     return data
@@ -53,17 +59,12 @@ def red_column_mask(
     height: int,
     red_min: float = 120,
     red_ratio: float = 1.8,
-    rows: int = 3,
 ) -> list:
     if width <= 0 or height <= 0 or not bgra:
         return []
-    mid = height // 2
-    half = max(0, rows // 2)
-    y0 = max(0, mid - half)
-    y1 = min(height, mid + half + 1)
     mask = [False] * width
     stride = width * 4
-    for y in range(y0, y1):
+    for y in range(height):
         row = y * stride
         for x in range(width):
             if mask[x]:
@@ -82,9 +83,8 @@ def hp_percent(
     height: int,
     red_min: float = 120,
     red_ratio: float = 1.8,
-    rows: int = 3,
 ) -> int:
-    mask = red_column_mask(bgra, width, height, red_min, red_ratio, rows)
+    mask = red_column_mask(bgra, width, height, red_min, red_ratio)
     rightmost = -1
     for x, flag in enumerate(mask):
         if flag:
@@ -119,33 +119,18 @@ def mask_strip_ppm(mask: list, strip_h: int = 8) -> bytes:
     return f"P6\n{width} {strip_h}\n255\n".encode("ascii") + (bytes(row) * strip_h)
 
 
-def preview_ppms(
-    bgra: bytes,
-    width: int,
-    height: int,
-    red_min: float = 120,
-    red_ratio: float = 1.8,
-    strip_h: int = 8,
-):
+def preview_ppms(bgra: bytes, width: int, height: int, red_min: float = 120, red_ratio: float = 1.8):
     mask = red_column_mask(bgra, width, height, red_min, red_ratio)
-    return bgra_to_ppm(bgra, width, height), mask_strip_ppm(mask, strip_h), hp_percent(
-        bgra, width, height, red_min, red_ratio
-    )
+    return bgra_to_ppm(bgra, width, height), mask_strip_ppm(mask), hp_percent(bgra, width, height, red_min, red_ratio)
 
 
-def click_at(point: Optional[dict]) -> bool:
-    """Left-click at screen coordinates."""
+def aim_at(point: Optional[dict]) -> bool:
+    """Only move the cursor — clicks are done by the user's mouse macro."""
     if not point or "x" not in point or "y" not in point:
         return False
     import ctypes
 
-    x, y = int(point["x"]), int(point["y"])
-    user32 = ctypes.windll.user32
-    user32.SetCursorPos(x, y)
-    time.sleep(0.02)
-    user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
-    time.sleep(0.04)
-    user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+    ctypes.windll.user32.SetCursorPos(int(point["x"]), int(point["y"]))
     return True
 
 
@@ -163,7 +148,9 @@ class AssistBot:
         self.on_stop = on_stop
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._click_error = False
+        self._aim_error = False
+        self._last_log = 0.0
+        self._current_aim: Optional[str] = None
 
     @property
     def running(self) -> bool:
@@ -185,37 +172,24 @@ class AssistBot:
             self.on_log(reason)
             self.on_stop(reason)
 
-    def _do_click(self, point: Optional[dict], label: str) -> None:
+    def _aim(self, point: Optional[dict], label: str) -> None:
+        """Move cursor only when switching slot (F1↔F2), so mouse macro can click stably."""
         try:
-            if not click_at(point):
-                if not self._click_error:
-                    self._click_error = True
-                    self.on_log(f"Немає точки кліку для «{label}». Відкалібруйте слот.")
+            if not point or "x" not in point or "y" not in point:
+                if not self._aim_error:
+                    self._aim_error = True
+                    self.on_log(f"Немає точки наведення «{label}».")
                 return
+            if self._current_aim == label:
+                return
+            if not aim_at(point):
+                return
+            self._current_aim = label
+            self.on_log(f"наведення: {label}")
         except Exception as exc:
-            if not self._click_error:
-                self._click_error = True
-                self.on_log(f"Помилка кліку ({label}): {exc}")
-
-    def _grab_region(self, region: dict, sct):
-        box = {
-            "left": int(region["left"]),
-            "top": int(region["top"]),
-            "width": int(region["width"]),
-            "height": int(region["height"]),
-        }
-        last_exc: Optional[Exception] = None
-        for _ in range(3):
-            try:
-                return sct.grab(box)
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(0.05)
-        try:
-            sct.grab(sct.monitors[1])
-            return sct.grab(box)
-        except Exception as exc:
-            raise last_exc or exc
+            if not self._aim_error:
+                self._aim_error = True
+                self.on_log(f"Помилка наведення ({label}): {exc}")
 
     def _grab_hp(self, region: Optional[dict], sct) -> Optional[int]:
         if not region:
@@ -223,14 +197,22 @@ class AssistBot:
         w, h = int(region["width"]), int(region["height"])
         if w <= 0 or h <= 0:
             return None
-        shot = self._grab_region(region, sct)
-        return hp_percent(
-            shot.bgra if hasattr(shot, "bgra") else bytes(shot.raw),
-            shot.width,
-            shot.height,
-            self.cfg.get("red_min", 120),
-            self.cfg.get("red_ratio", 1.8),
-        )
+        box = {k: int(region[k]) for k in ("left", "top", "width", "height")}
+        last_exc: Optional[Exception] = None
+        for _ in range(3):
+            try:
+                shot = sct.grab(box)
+                return hp_percent(
+                    shot.bgra if hasattr(shot, "bgra") else bytes(shot.raw),
+                    shot.width,
+                    shot.height,
+                    self.cfg.get("red_min", 120),
+                    self.cfg.get("red_ratio", 1.8),
+                )
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.05)
+        raise last_exc or RuntimeError("grab failed")
 
     def _loop(self) -> None:
         try:
@@ -241,19 +223,18 @@ class AssistBot:
 
         target_reg = self.cfg.get("target_region")
         if not target_reg:
-            self.stop("Спочатку відкалібруйте смугу HP цілі.")
+            self.stop("Відкалібруйте HP цілі.")
             return
-
-        attack_click = self.cfg.get("attack_click")
-        next_click = self.cfg.get("next_click")
-        if not attack_click or not next_click:
-            self.stop("Відкалібруйте кліки: слот атаки і слот наступної цілі.")
+        attack_aim = self.cfg.get("attack_aim")
+        next_aim = self.cfg.get("next_aim")
+        if not attack_aim or not next_aim:
+            self.stop("Відкалібруйте наведення F1 і F2.")
             return
 
         stuck_sec = float(self.cfg.get("stuck_seconds", 8))
         max_stuck = int(self.cfg.get("max_stuck", 3))
         own_stop = int(self.cfg.get("own_hp_stop", 30))
-        pmin = int(self.cfg.get("pause_min_ms", 300))
+        pmin = int(self.cfg.get("pause_min_ms", 400))
         pmax = int(self.cfg.get("pause_max_ms", 700))
         if pmax < pmin:
             pmin, pmax = pmax, pmin
@@ -261,8 +242,12 @@ class AssistBot:
         last_hp: Optional[int] = None
         last_change = time.monotonic()
         stuck_count = 0
-        self.on_log("Бот запущено (кліки). Через 2 с — клікніть у гру.")
-        if self._stop.wait(2.0):
+        self._current_aim = None
+        self.on_log(
+            "Бот: тільки наведення F1/F2 (курсор не дрижить). "
+            "Макрос миші — клік ~500мс. Спочатку перевірте макрос БЕЗ бота. F12 — стоп."
+        )
+        if self._stop.wait(1.5):
             return
 
         with mss.mss() as sct:
@@ -284,20 +269,17 @@ class AssistBot:
 
                 now = time.monotonic()
                 if target_hp <= 0:
-                    self._do_click(next_click, "наступна ціль")
+                    self._aim(next_aim, "F2")
                     last_hp = None
                     last_change = now
                 elif last_hp is not None and target_hp == last_hp and (now - last_change) >= stuck_sec:
-                    self._do_click(next_click, "наступна ціль")
+                    self._aim(next_aim, "F2")
                     stuck_count += 1
-                    self.on_log(
-                        f"HP цілі не змінюється {stuck_sec:.0f} с — наступна ціль "
-                        f"({stuck_count}/{max_stuck})."
-                    )
+                    self.on_log(f"HP не змінюється {stuck_sec:.0f} с — F2 ({stuck_count}/{max_stuck})")
                     last_hp = None
                     last_change = now
                     if stuck_count >= max_stuck:
-                        self.stop(f"Застрягання {stuck_count} разів поспіль. Стоп.")
+                        self.stop(f"Застрягання {stuck_count} разів. Стоп.")
                         return
                 else:
                     if last_hp is not None and target_hp != last_hp:
@@ -305,8 +287,7 @@ class AssistBot:
                     if last_hp != target_hp:
                         last_hp = target_hp
                         last_change = now
-                    self._do_click(attack_click, "атака")
+                    self._aim(attack_aim, "F1")
 
-                wait = random.uniform(pmin, pmax) / 1000.0
-                if self._stop.wait(wait):
+                if self._stop.wait(random.uniform(pmin, pmax) / 1000.0):
                     return

@@ -1,4 +1,4 @@
-"""Tkinter UI for the Lineage 2 assist bot. Entry point: python ui.py"""
+"""Tkinter UI. Entry: python ui.py — aim-only assistant, F12 stops."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def set_dpi_awareness() -> None:
 
 
 class Calibrator(tk.Toplevel):
-    """Semi-transparent region picker for HP bars."""
+    """Semi-transparent HP region picker."""
 
     def __init__(self, master: tk.Tk, title: str, initial: Optional[dict], on_save):
         super().__init__(master)
@@ -46,7 +46,6 @@ class Calibrator(tk.Toplevel):
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
         tk.Button(bar, text="Зберегти", command=self._save).pack(side="left", padx=4, pady=2)
-
         handle = tk.Frame(bar, bg="white", width=14, height=14, cursor="sizing")
         handle.pack(side="right", padx=3, pady=6)
         handle.pack_propagate(False)
@@ -88,7 +87,7 @@ class Calibrator(tk.Toplevel):
 
 
 class PointPicker(tk.Toplevel):
-    """Fullscreen overlay: one left-click saves skill-slot coordinates."""
+    """One click saves aim coordinates for a skill slot."""
 
     def __init__(self, master: tk.Tk, title: str, on_save):
         super().__init__(master)
@@ -100,23 +99,21 @@ class PointPicker(tk.Toplevel):
         self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
         tk.Label(
             self,
-            text=f"{title}\nКлікніть ЛКМ по слоту на панелі умінь",
+            text=f"{title}\nКлікніть по слоту — збережеться лише позиція курсора",
             bg="#1a5276",
             fg="white",
             font=("Segoe UI", 16, "bold"),
         ).pack(expand=True)
-        self.bind("<ButtonPress-1>", self._click)
+        self.bind("<ButtonPress-1>", self._pick)
         self.bind("<Escape>", lambda e: self.destroy())
         self.focus_force()
 
-    def _click(self, e) -> None:
+    def _pick(self, e) -> None:
         self._on_save({"x": int(e.x_root), "y": int(e.y_root)})
         self.destroy()
 
 
 class CalibPreview(tk.Toplevel):
-    """Live enlarged grab + red-column mask for calibrated HP regions."""
-
     def __init__(self, master: tk.Tk, cfg: dict):
         super().__init__(master)
         self.cfg = cfg
@@ -140,7 +137,6 @@ class CalibPreview(tk.Toplevel):
             strip = tk.Label(frm)
             strip.pack()
             self.sections[key] = (status, img, strip)
-
         try:
             import mss
 
@@ -152,12 +148,6 @@ class CalibPreview(tk.Toplevel):
     def _photo(self, ppm: bytes, zoom: int) -> tk.PhotoImage:
         img = tk.PhotoImage(data=ppm, format="PPM")
         return img.zoom(zoom, zoom) if zoom > 1 else img
-
-    def _grab(self, region: dict):
-        box = {k: int(region[k]) for k in ("left", "top", "width", "height")}
-        shot = self._sct.grab(box)
-        bgra = shot.bgra if hasattr(shot, "bgra") else bytes(shot.raw)
-        return bgra, shot.width, shot.height
 
     def _tick(self) -> None:
         if not self.winfo_exists():
@@ -176,12 +166,14 @@ class CalibPreview(tk.Toplevel):
                 status.config(text="немає mss")
                 continue
             try:
-                bgra, w, h = self._grab(region)
-                ppm, strip, hp = preview_ppms(bgra, w, h, red_min, red_ratio)
+                box = {k: int(region[k]) for k in ("left", "top", "width", "height")}
+                shot = self._sct.grab(box)
+                bgra = shot.bgra if hasattr(shot, "bgra") else bytes(shot.raw)
+                ppm, strip, hp = preview_ppms(bgra, shot.width, shot.height, red_min, red_ratio)
             except Exception as exc:
-                status.config(text=f"помилка захоплення: {exc}")
+                status.config(text=f"помилка: {exc}")
                 continue
-            zoom = max(1, min(16, 300 // max(1, w)))
+            zoom = max(1, min(16, 300 // max(1, shot.width)))
             photo, mask = self._photo(ppm, zoom), self._photo(strip, zoom)
             self._imgs.extend((photo, mask))
             status.config(text=f"HP: {hp}%")
@@ -207,7 +199,7 @@ class App(tk.Tk):
         ("pause_min_ms", "Пауза мін (мс)", 8),
         ("pause_max_ms", "Пауза макс (мс)", 8),
         ("stuck_seconds", "Застрягання (с)", 8),
-        ("max_stuck", "Макс. застрягань поспіль", 8),
+        ("max_stuck", "Макс. застрягань", 8),
         ("own_hp_stop", "Поріг мого HP (%)", 8),
     )
 
@@ -221,6 +213,7 @@ class App(tk.Tk):
         self.cfg = load_config()
         self.q: queue.Queue = queue.Queue()
         self.bot: Optional[AssistBot] = None
+        self._kb = None
         self.vars = {key: tk.StringVar(value=str(self.cfg.get(key, ""))) for key, *_ in self.FIELDS}
 
         pad = {"padx": 6, "pady": 2}
@@ -251,14 +244,14 @@ class App(tk.Tk):
             side="left", padx=4, pady=2
         )
 
-        clicks = tk.Frame(self)
-        clicks.grid(row=9, column=0, columnspan=2, sticky="ew")
-        ttk.Button(clicks, text="Клік атаки", command=lambda: self._pick_point("attack_click", "Слот атаки")).pack(
+        aims = tk.Frame(self)
+        aims.grid(row=9, column=0, columnspan=2, sticky="ew")
+        ttk.Button(aims, text="Наведення F1", command=lambda: self._pick_point("attack_aim", "F1 атака")).pack(
             side="left", padx=4, pady=2
         )
-        ttk.Button(
-            clicks, text="Клік наступної цілі", command=lambda: self._pick_point("next_click", "Слот наступної цілі")
-        ).pack(side="left", padx=4, pady=2)
+        ttk.Button(aims, text="Наведення F2", command=lambda: self._pick_point("next_aim", "F2 наступна")).pack(
+            side="left", padx=4, pady=2
+        )
 
         ttk.Button(self, text="Перевірити калібрування", command=self._open_preview).grid(
             row=10, column=0, columnspan=2, padx=6, pady=2, sticky="ew"
@@ -267,14 +260,14 @@ class App(tk.Tk):
         self.logbox = scrolledtext.ScrolledText(self, height=8, width=42, state="disabled", wrap="word")
         self.logbox.grid(row=11, column=0, columnspan=2, padx=6, pady=6, sticky="nsew")
 
+        self._bind_f12()
         self.after(50, self._pump)
-        self._log("Готово. Відкалібруйте HP і кліки по слотах. Старт → клікніть у гру.")
+        self._log("Тільки наведення на F1/F2. Клік — макрос миші. F12 — стоп.")
 
     def _read_fields(self) -> None:
         for key, *_ in self.FIELDS:
-            raw = self.vars[key].get().strip()
             try:
-                self.cfg[key] = int(raw)
+                self.cfg[key] = int(self.vars[key].get().strip())
             except ValueError:
                 pass
 
@@ -290,7 +283,7 @@ class App(tk.Tk):
         def saved(point):
             self.cfg[field] = point
             save_config(self.cfg)
-            self._log(f"{title}: клік @ ({point['x']}, {point['y']})")
+            self._log(f"{title}: наведення @ ({point['x']}, {point['y']})")
 
         PointPicker(self, title, saved)
 
@@ -349,11 +342,25 @@ class App(tk.Tk):
             pass
         self.after(50, self._pump)
 
+    def _bind_f12(self) -> None:
+        try:
+            import keyboard
+
+            keyboard.add_hotkey("f12", lambda: self._request_stop("Зупинено F12."))
+            self._kb = keyboard
+        except Exception as exc:
+            self.after(100, lambda: self._log(f"F12 не підключено ({exc})."))
+
     def _close(self) -> None:
         self._request_stop("Вікно закрито.")
         prev = getattr(self, "_preview", None)
         if prev is not None and prev.winfo_exists():
             prev._close()
+        if self._kb is not None:
+            try:
+                self._kb.unhook_all()
+            except Exception:
+                pass
         self.destroy()
 
 
