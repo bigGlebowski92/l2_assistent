@@ -1,4 +1,4 @@
-"""Lineage 2 assist: read HP bars, aim mouse at F1/F2 slots (no clicks)."""
+"""Lineage 2 assist: HP bars -> click F1/F2; low own HP -> F3. Ctrl macro unsticks input."""
 
 from __future__ import annotations
 
@@ -16,11 +16,17 @@ DEFAULTS = {
     "pause_max_ms": 700,
     "stuck_seconds": 8,
     "max_stuck": 3,
-    "own_hp_stop": 30,
+    "own_hp_stop": 30,  # якщо моє HP < цього % — клік F3 (0 = вимкнено)
     "target_region": None,
     "own_hp_region": None,
     "attack_aim": None,  # {"x": int, "y": int} — F1 slot
     "next_aim": None,  # {"x": int, "y": int} — F2 slot
+    "heal_aim": None,  # {"x": int, "y": int} — F3 heal/skill
+    "click_settle_ms": 60,  # пауза після SetCursorPos перед кліком (час для Ctrl-макросу)
+    "switch_settle_ms": 150,  # довша пауза при F1↔F2 (після руху кліки часто «мертві»)
+    "switch_extra_clicks": 0,  # додаткові кліки без повторного SetCursorPos після зміни слота
+    "unstick_key": True,  # перед кліком натиснути клавішу (замість макросу Ctrl на миші)
+    "unstick_vk": 0x20,  # VK: Space=0x20, Control=0x11
     "red_min": 120,
     "red_ratio": 1.8,
 }
@@ -124,13 +130,47 @@ def preview_ppms(bgra: bytes, width: int, height: int, red_min: float = 120, red
     return bgra_to_ppm(bgra, width, height), mask_strip_ppm(mask), hp_percent(bgra, width, height, red_min, red_ratio)
 
 
-def aim_at(point: Optional[dict]) -> bool:
-    """Only move the cursor — clicks are done by the user's mouse macro."""
+def _tap_vk(vk: int) -> None:
+    """Short key tap (may unstick soft mouse after SetCursorPos — test vs mouse Ctrl macro)."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.keybd_event(vk, 0, 0, 0)
+    time.sleep(0.015)
+    user32.keybd_event(vk, 0, 2, 0)  # KEYEVENTF_KEYUP
+    time.sleep(0.01)
+
+
+def _left_click(unstick_vk: Optional[int] = None) -> None:
+    import ctypes
+
+    if unstick_vk:
+        _tap_vk(int(unstick_vk))
+    user32 = ctypes.windll.user32
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+    time.sleep(0.03)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+
+
+def click_at(
+    point: Optional[dict],
+    settle_ms: int = 60,
+    move: bool = True,
+    times: int = 1,
+    unstick_vk: Optional[int] = None,
+) -> bool:
+    """Optional SetCursorPos + key tap + left-click(s)."""
     if not point or "x" not in point or "y" not in point:
         return False
     import ctypes
 
-    ctypes.windll.user32.SetCursorPos(int(point["x"]), int(point["y"]))
+    if move:
+        ctypes.windll.user32.SetCursorPos(int(point["x"]), int(point["y"]))
+        time.sleep(max(0, settle_ms) / 1000.0)
+    for i in range(max(1, times)):
+        if i:
+            time.sleep(0.05)
+        _left_click(unstick_vk=unstick_vk)
     return True
 
 
@@ -148,9 +188,9 @@ class AssistBot:
         self.on_stop = on_stop
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._aim_error = False
+        self._click_error = False
         self._last_log = 0.0
-        self._current_aim: Optional[str] = None
+        self._last_slot: Optional[str] = None
 
     @property
     def running(self) -> bool:
@@ -172,24 +212,33 @@ class AssistBot:
             self.on_log(reason)
             self.on_stop(reason)
 
-    def _aim(self, point: Optional[dict], label: str) -> None:
-        """Move cursor only when switching slot (F1↔F2), so mouse macro can click stably."""
+    def _click(self, point: Optional[dict], label: str) -> None:
+        """Click slot. On F1↔F2: move once, longer settle, extra clicks; same slot: click only."""
         try:
             if not point or "x" not in point or "y" not in point:
-                if not self._aim_error:
-                    self._aim_error = True
-                    self.on_log(f"Немає точки наведення «{label}».")
+                if not self._click_error:
+                    self._click_error = True
+                    self.on_log(f"Немає точки кліку «{label}».")
                 return
-            if self._current_aim == label:
-                return
-            if not aim_at(point):
-                return
-            self._current_aim = label
-            self.on_log(f"наведення: {label}")
+            unstick_vk = None
+            if self.cfg.get("unstick_key", True):
+                unstick_vk = int(self.cfg.get("unstick_vk", 0x20))
+            switched = self._last_slot != label
+            if switched:
+                settle = int(self.cfg.get("switch_settle_ms", 150))
+                times = 1 + max(0, int(self.cfg.get("switch_extra_clicks", 2)))
+                ok = click_at(point, settle_ms=settle, move=True, times=times, unstick_vk=unstick_vk)
+                if ok:
+                    self._last_slot = label
+                    self.on_log(f"клік: {label} (перемикання ×{times})")
+            else:
+                settle = int(self.cfg.get("click_settle_ms", 60))
+                # Already on slot — do not SetCursorPos again (re-move re-sticks clicks).
+                click_at(point, settle_ms=settle, move=False, times=1, unstick_vk=unstick_vk)
         except Exception as exc:
-            if not self._aim_error:
-                self._aim_error = True
-                self.on_log(f"Помилка наведення ({label}): {exc}")
+            if not self._click_error:
+                self._click_error = True
+                self.on_log(f"Помилка кліку ({label}): {exc}")
 
     def _grab_hp(self, region: Optional[dict], sct) -> Optional[int]:
         if not region:
@@ -225,28 +274,39 @@ class AssistBot:
         if not target_reg:
             self.stop("Відкалібруйте HP цілі.")
             return
-        attack_aim = self.cfg.get("attack_aim")
-        next_aim = self.cfg.get("next_aim")
+        attack_aim = self.cfg.get("attack_aim") or self.cfg.get("attack_click")
+        next_aim = self.cfg.get("next_aim") or self.cfg.get("next_click")
+        heal_aim = self.cfg.get("heal_aim")
         if not attack_aim or not next_aim:
             self.stop("Відкалібруйте наведення F1 і F2.")
             return
 
         stuck_sec = float(self.cfg.get("stuck_seconds", 8))
         max_stuck = int(self.cfg.get("max_stuck", 3))
-        own_stop = int(self.cfg.get("own_hp_stop", 30))
+        own_heal = int(self.cfg.get("own_hp_stop", 30))
         pmin = int(self.cfg.get("pause_min_ms", 400))
         pmax = int(self.cfg.get("pause_max_ms", 700))
         if pmax < pmin:
             pmin, pmax = pmax, pmin
+        if own_heal > 0 and not heal_aim:
+            self.stop("Поріг HP > 0: відкалібруйте наведення F3.")
+            return
 
         last_hp: Optional[int] = None
         last_change = time.monotonic()
         stuck_count = 0
-        self._current_aim = None
-        self.on_log(
-            "Бот: тільки наведення F1/F2 (курсор не дрижить). "
-            "Макрос миші — клік ~500мс. Спочатку перевірте макрос БЕЗ бота. F12 — стоп."
-        )
+        heal_used = False
+        self._last_slot = None
+        unstick = "перед кліком Space" if self.cfg.get("unstick_key", True) else "без Space"
+        if own_heal > 0:
+            self.on_log(
+                f"Бот: F1/F2 / F3 якщо HP < {own_heal}%. {unstick}. "
+                "Макрос Ctrl на миші можна вимкнути для тесту. F12 — стоп."
+            )
+        else:
+            self.on_log(
+                f"Бот: F1/F2 (F3 вимк — поріг 0). {unstick}. F12 — стоп."
+            )
         if self._stop.wait(1.5):
             return
 
@@ -263,17 +323,29 @@ class AssistBot:
                     return
                 self.on_hp(target_hp, own_hp)
 
-                if own_hp is not None and own_hp < own_stop:
-                    self.stop(f"Моє HP {own_hp}% нижче порогу {own_stop}%.")
-                    return
+                # F3 один раз, коли HP падає нижче порогу; після хілу знову F1/F2.
+                if own_heal > 0 and own_hp is not None:
+                    if own_hp >= own_heal:
+                        heal_used = False
+                    elif not heal_used:
+                        self._click(heal_aim, "F3")
+                        heal_used = True
+                        self.on_log(f"Моє HP {own_hp}% < {own_heal}% — F3")
+                        if self._stop.wait(random.uniform(pmin, pmax) / 1000.0):
+                            return
+                        continue
 
                 now = time.monotonic()
                 if target_hp <= 0:
-                    self._aim(next_aim, "F2")
+                    # F2 лише один раз за епізод «немає цілі», не кожен тік циклу.
+                    if self._last_slot != "F2":
+                        self._click(next_aim, "F2")
                     last_hp = None
                     last_change = now
                 elif last_hp is not None and target_hp == last_hp and (now - last_change) >= stuck_sec:
-                    self._aim(next_aim, "F2")
+                    # Примусово один F2 на застрягання (навіть якщо вже були на F2 раніше).
+                    self._last_slot = None
+                    self._click(next_aim, "F2")
                     stuck_count += 1
                     self.on_log(f"HP не змінюється {stuck_sec:.0f} с — F2 ({stuck_count}/{max_stuck})")
                     last_hp = None
@@ -287,7 +359,7 @@ class AssistBot:
                     if last_hp != target_hp:
                         last_hp = target_hp
                         last_change = now
-                    self._aim(attack_aim, "F1")
+                    self._click(attack_aim, "F1")
 
                 if self._stop.wait(random.uniform(pmin, pmax) / 1000.0):
                     return

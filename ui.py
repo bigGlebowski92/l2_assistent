@@ -1,4 +1,4 @@
-"""Tkinter UI. Entry: python ui.py — aim-only assistant, F12 stops."""
+"""Tkinter UI. Entry: python ui.py — aim+click assistant, F12 stops."""
 
 from __future__ import annotations
 
@@ -200,7 +200,7 @@ class App(tk.Tk):
         ("pause_max_ms", "Пауза макс (мс)", 8),
         ("stuck_seconds", "Застрягання (с)", 8),
         ("max_stuck", "Макс. застрягань", 8),
-        ("own_hp_stop", "Поріг мого HP (%)", 8),
+        ("own_hp_stop", "Поріг HP → F3 (%)", 8),
     )
 
     def __init__(self):
@@ -252,6 +252,9 @@ class App(tk.Tk):
         ttk.Button(aims, text="Наведення F2", command=lambda: self._pick_point("next_aim", "F2 наступна")).pack(
             side="left", padx=4, pady=2
         )
+        ttk.Button(aims, text="Наведення F3", command=lambda: self._pick_point("heal_aim", "F3 хіл")).pack(
+            side="left", padx=4, pady=2
+        )
 
         ttk.Button(self, text="Перевірити калібрування", command=self._open_preview).grid(
             row=10, column=0, columnspan=2, padx=6, pady=2, sticky="ew"
@@ -262,7 +265,9 @@ class App(tk.Tk):
 
         self._bind_f12()
         self.after(50, self._pump)
-        self._log("Тільки наведення на F1/F2. Клік — макрос миші. F12 — стоп.")
+        self._log(
+            "F1/F2/F3. Перед кліком асистент тисне Space (замість макросу Ctrl — перевір). F12 — стоп."
+        )
 
     def _read_fields(self) -> None:
         for key, *_ in self.FIELDS:
